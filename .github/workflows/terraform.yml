@@ -1,0 +1,105 @@
+name: Terraform CI/CD Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Allow manual triggering
+
+env:
+  TF_LOG: INFO
+  AWS_REGION: ap-northeast-1
+
+jobs:
+  terraform-test:
+    name: Terraform Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          echo "${{ secrets.SSH_PUBLIC_KEY }}" > ~/.ssh/id_rsa.pub
+          chmod 600 ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa.pub
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+
+      - name: Create tfvars file
+        run: |
+          cat > terraform.tfvars << EOF
+          aws_region  = "${{ env.AWS_REGION }}"
+          aws_profile = ""  # Not needed when using GitHub Actions credentials
+          prefix      = "ci-test"
+          
+          instance_type   = "t3.small"  # Using smaller instance to save costs in CI
+          ami_id          = "ami-0599b6e53ca798bb2"
+          ssh_public_key_path = "~/.ssh/id_rsa.pub"
+          
+          s3_logs_expiration_days = 7
+          default_tags = {
+            division   = "platform"
+            org        = "engineering"
+            keep-until = "2026-01-01"
+            team       = "observability"
+            project    = "elastic-monitoring"
+          }
+          EOF
+
+      - name: Terraform Init
+        id: init
+        run: terraform init
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check
+        continue-on-error: true
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -out=tfplan
+        continue-on-error: true
+
+      - name: Terraform Apply
+        id: apply
+        run: terraform apply -auto-approve tfplan
+        
+      - name: Wait for Resources to be Ready
+        run: sleep 60  # Wait a minute for resources to be fully provisioned
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Test GuardDuty Integration
+        run: |
+          chmod +x ./test.py
+          ./test.py --region ${{ env.AWS_REGION }}
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
+        if: always()  # Always run this step, even if previous steps fail
